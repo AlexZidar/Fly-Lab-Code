@@ -1,0 +1,9 @@
+# PlatformIO build artifacts
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+
+# OS files
+Thumbs.db
+.DS_Store

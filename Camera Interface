@@ -1,0 +1,312 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  e-Shock LED — Camera Interface with Arduino Integration
+# ═══════════════════════════════════════════════════════════════════════
+#  Requirements:  pip install opencv-python pypylon pyserial
+# ═══════════════════════════════════════════════════════════════════════
+
+import os
+import cv2
+import time
+import serial
+import serial.tools.list_ports
+import threading
+import datetime
+from pypylon import pylon
+
+
+# ── Helper: list COM ports and let the user pick ────────────────────────
+def choose_serial_port():
+    ports = serial.tools.list_ports.comports()
+    if not ports:
+        print("  No COM ports detected. Arduino features will be DISABLED.")
+        return None
+    print("\nAvailable COM ports:")
+    for i, p in enumerate(ports):
+        print(f"  [{i}] {p.device}  –  {p.description}")
+    choice = input("Select port index (default 0): ").strip()
+    idx = int(choice) if choice else 0
+    return ports[idx].device
+
+
+# ── Helper: open serial and wait for READY ──────────────────────────────
+def open_arduino(port, baud=115200, timeout=5):
+    if port is None:
+        return None
+    try:
+        ser = serial.Serial(port, baud, timeout=2)
+        time.sleep(2)                     # let bootloader finish
+        ser.reset_input_buffer()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if ser.in_waiting:
+                line = ser.readline().decode('utf-8', errors='replace').strip()
+                if line == "READY":
+                    print(f"  Arduino connected on {port}")
+                    return ser
+        print("  Warning: Arduino did not send READY – continuing anyway.")
+        return ser
+    except Exception as e:
+        print(f"  Could not open {port}: {e}")
+        return None
+
+
+# ── Helper: send a command & wait for OK ────────────────────────────────
+def send_cmd(ser, cmd):
+    if ser is None:
+        return
+    ser.write((cmd + '\n').encode())
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if ser.in_waiting:
+            resp = ser.readline().decode('utf-8', errors='replace').strip()
+            if resp == "OK":
+                return
+            # Relay any other messages
+            if resp:
+                print(f"  [Arduino] {resp}")
+    print(f"  Warning: no OK for '{cmd}'")
+
+
+# ── Helper: background reader that prints Arduino messages ──────────────
+_reader_stop = threading.Event()
+
+
+def serial_reader(ser, tag=""):
+    """Continuously read lines from Arduino and print them."""
+    while not _reader_stop.is_set():
+        try:
+            if ser and ser.in_waiting:
+                line = ser.readline().decode('utf-8', errors='replace').strip()
+                if line:
+                    print(f"  [{tag}] {line}")
+            else:
+                time.sleep(0.01)
+        except Exception:
+            break
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+print("=== e-Shock LED — Camera Recorder ===\n")
+
+# ── 1. Connect camera ──────────────────────────────────────────────────
+camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+camera.Open()
+converter = pylon.ImageFormatConverter()
+converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+
+# ── 2. Connect Arduino ─────────────────────────────────────────────────
+port = choose_serial_port()
+ser = open_arduino(port)
+
+# ── 3. Collect user settings (camera, LED, shock) ──────────────────────
+while True:
+    try:
+        print("\n─── Camera Settings ───────────────────────────────────")
+        exposure_input = input("  Exposure time µs (default 10000): ").strip()
+        fps_input      = input("  Frame rate fps   (default 200):   ").strip()
+        exposure_time  = int(exposure_input) if exposure_input else 10000
+        fps            = int(fps_input) if fps_input else 200
+
+        print("\n─── LED Strip Settings ────────────────────────────────")
+        num_leds_in   = input("  Number of LEDs        (default 8):   ").strip()
+        bright_in     = input("  Brightness 0-255      (default 128): ").strip()
+        r_in          = input("  Red   0-255           (default 255): ").strip()
+        g_in          = input("  Green 0-255           (default 0):   ").strip()
+        b_in          = input("  Blue  0-255           (default 0):   ").strip()
+        led_on_in     = input("  LED ON  time ms       (default 500): ").strip()
+        led_off_in    = input("  LED OFF time ms       (default 500): ").strip()
+
+        num_leds   = int(num_leds_in) if num_leds_in else 8
+        brightness = int(bright_in)   if bright_in   else 128
+        led_r      = int(r_in)        if r_in        else 255
+        led_g      = int(g_in)        if g_in        else 0
+        led_b      = int(b_in)        if b_in        else 0
+        led_on_ms  = int(led_on_in)   if led_on_in   else 500
+        led_off_ms = int(led_off_in)  if led_off_in  else 500
+
+        print("\n─── Shock Sequence Settings ───────────────────────────")
+        shock_on_in   = input("  Shock ON  time ms     (default 200): ").strip()
+        shock_off_in  = input("  Shock OFF time ms     (default 800): ").strip()
+        shock_cyc_in  = input("  Number of shock cycles(default 5):   ").strip()
+
+        shock_on_ms   = int(shock_on_in)  if shock_on_in  else 200
+        shock_off_ms  = int(shock_off_in) if shock_off_in else 800
+        shock_cycles  = int(shock_cyc_in) if shock_cyc_in else 5
+
+        # ── Apply camera settings ───────────────────────────────────
+        camera.ExposureAuto.SetValue('Off')
+        camera.ExposureTime.SetValue(exposure_time)
+        try:
+            if camera.AcquisitionFrameRateEnable.GetValue():
+                camera.AcquisitionFrameRate.SetValue(fps)
+        except Exception as e:
+            print(f"  Warning: Could not set camera frame rate. {e}")
+
+        # ── Send configs to Arduino ─────────────────────────────────
+        led_cfg   = f"CONFIG_LED:{num_leds},{brightness},{led_r},{led_g},{led_b},{led_on_ms},{led_off_ms}"
+        shock_cfg = f"CONFIG_SHOCK:{shock_on_ms},{shock_off_ms},{shock_cycles}"
+        send_cmd(ser, led_cfg)
+        send_cmd(ser, shock_cfg)
+
+        # ── Preview phase (LEDs active, shocks SIMULATED) ──────────
+        print("\nStarting PREVIEW — LEDs will run, shocks are SIMULATED (print only)...")
+        send_cmd(ser, "PREVIEW")            # Arduino: LEDs + serial msgs, no pin 3
+
+        _reader_stop.clear()
+        if ser:
+            reader_t = threading.Thread(target=serial_reader, args=(ser, "Preview"), daemon=True)
+            reader_t.start()
+
+        camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        cv2.namedWindow('Basler Livestream (Preview)', cv2.WINDOW_NORMAL)
+
+        preview_frame_count = 0
+        while camera.IsGrabbing() and preview_frame_count < 1000:
+            grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+            if grabResult.GrabSucceeded():
+                image = converter.Convert(grabResult)
+                img = image.GetArray()
+                cv2.imshow('Basler Livestream (Preview)', img)
+                preview_frame_count += 1
+                if cv2.waitKey(1) == 27:
+                    break
+            grabResult.Release()
+
+        cv2.destroyWindow('Basler Livestream (Preview)')
+        camera.StopGrabbing()
+
+        # Stop Arduino preview
+        _reader_stop.set()
+        send_cmd(ser, "STOP")
+
+        proceed = input("\nContinue and record with these settings? (y/n): ").strip().lower()
+        if proceed == 'y':
+            break
+
+    except Exception as e:
+        print(f"  Error: {e}")
+        continue
+
+# ═══════════════════════════════════════════════════════════════════════
+#  RECORDING PHASE
+# ═══════════════════════════════════════════════════════════════════════
+camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+record_input  = input("Do you want to record the video? (y/n): ").strip().lower()
+should_record = record_input == 'y'
+
+duration_input  = input("Enter recording duration in minutes (default 1): ").strip()
+record_minutes  = int(duration_input) if duration_input else 1
+record_seconds  = record_minutes * 60
+
+total_target_frames = record_seconds * fps
+current_frame_count = 0
+start_time = time.time()
+
+early_stop = False
+
+
+def wait_for_enter():
+    input("Press Enter at any time to stop recording early...\n")
+    global early_stop
+    early_stop = True
+
+
+stop_thread = threading.Thread(target=wait_for_enter, daemon=True)
+stop_thread.start()
+
+# Start background serial reader for RECORD tags
+_reader_stop.clear()
+if ser:
+    rec_reader = threading.Thread(target=serial_reader, args=(ser, "Record"), daemon=True)
+    rec_reader.start()
+
+# First frame — determine size
+grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+if grabResult.GrabSucceeded():
+    image = converter.Convert(grabResult)
+    frame = image.GetArray()
+    height, width = frame.shape[:2]
+
+    if should_record:
+        recording_start_datetime = datetime.datetime.now()
+        print(f"\nRecording started at: {recording_start_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        desktop_path = os.path.join(os.path.expanduser("~"), "Downloads")
+        target_dir = os.path.join(desktop_path, "YMazeMP4")
+        os.makedirs(target_dir, exist_ok=True)
+        timestamp = recording_start_datetime.strftime("_%Y%m%d_%H%M%S")
+        file_name = f"basler_capture{timestamp}.mp4"
+        output_path = os.path.join(target_dir, file_name)
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        print(f"Recording to: {output_path}")
+    else:
+        out = None
+else:
+    grabResult.Release()
+    camera.StopGrabbing()
+    raise RuntimeError("Failed to retrieve initial frame.")
+grabResult.Release()
+
+# ── Trigger Arduino RECORD mode (LEDs + real shocks on pin 3) ──────────
+print("\n>>> Starting shock + LED sequence on Arduino (RECORD mode) <<<")
+send_cmd(ser, "RECORD")
+
+frame_duration = 1.0 / fps
+last_frame_time = time.time()
+
+cv2.namedWindow('Basler Livestream', cv2.WINDOW_NORMAL)
+
+while camera.IsGrabbing():
+    if early_stop:
+        print("\nRecording manually stopped by user.")
+        break
+    if cv2.waitKey(1) == 27:
+        print("\nRecording manually stopped with ESC.")
+        break
+    if should_record and current_frame_count >= total_target_frames:
+        print(f"\nRecording stopped after {record_minutes} minute(s) via frame count.")
+        break
+
+    grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+    if grabResult.GrabSucceeded():
+        image = converter.Convert(grabResult)
+        img = image.GetArray()
+        cv2.imshow('Basler Livestream', img)
+
+        if should_record:
+            out.write(img)
+            current_frame_count += 1
+
+        time_to_wait = frame_duration - (time.time() - last_frame_time)
+        if time_to_wait > 0:
+            time.sleep(time_to_wait)
+        last_frame_time = time.time()
+
+    grabResult.Release()
+
+# ── Cleanup ─────────────────────────────────────────────────────────────
+_reader_stop.set()
+send_cmd(ser, "STOP")
+
+camera.StopGrabbing()
+if out:
+    out.release()
+    end_time = time.time()
+    actual_duration = end_time - start_time
+    recording_end_datetime = datetime.datetime.now()
+    print(f"Recording finished at: {recording_end_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Recorded {current_frame_count} frames over {actual_duration:.2f} seconds.")
+
+cv2.destroyAllWindows()
+if ser:
+    ser.close()
+    print("Arduino serial port closed.")
+
+print("\nDone.")
+cv2.destroyAllWindows()
