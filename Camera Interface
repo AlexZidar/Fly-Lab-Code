@@ -153,7 +153,12 @@ while True:
 
         # ── Preview phase (LEDs active, shocks SIMULATED) ──────────
         print("\nStarting PREVIEW — LEDs will run, shocks are SIMULATED (print only)...")
-        send_cmd(ser, "PREVIEW")            # Arduino: LEDs + serial msgs, no pin 3
+        print("Press ESC in the preview window to exit preview.\n")
+
+        try:
+            send_cmd(ser, "PREVIEW")        # Arduino: LEDs + serial msgs, no pin 3
+        except Exception as e:
+            print(f"  Warning: could not start Arduino preview: {e}")
 
         _reader_stop.clear()
         if ser:
@@ -163,15 +168,13 @@ while True:
         camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
         cv2.namedWindow('Basler Livestream (Preview)', cv2.WINDOW_NORMAL)
 
-        preview_frame_count = 0
-        while camera.IsGrabbing() and preview_frame_count < 1000:
+        while camera.IsGrabbing():
             grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
             if grabResult.GrabSucceeded():
                 image = converter.Convert(grabResult)
                 img = image.GetArray()
                 cv2.imshow('Basler Livestream (Preview)', img)
-                preview_frame_count += 1
-                if cv2.waitKey(1) == 27:
+                if cv2.waitKey(30) == 27:   # 30 ms wait keeps window responsive; ESC exits
                     break
             grabResult.Release()
 
